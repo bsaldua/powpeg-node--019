@@ -1,0 +1,409 @@
+package co.rsk.federate.bitcoin;
+
+import co.rsk.bitcoinj.core.BtcTransaction;
+import co.rsk.bitcoinj.wallet.Wallet;
+import co.rsk.federate.adapter.ThinConverter;
+import co.rsk.peg.*;
+import co.rsk.peg.federation.Federation;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+import com.google.common.util.concurrent.Service;
+import org.bitcoinj.core.*;
+import org.bitcoinj.core.TransactionConfidence.ConfidenceType;
+import org.bitcoinj.core.listeners.BlocksDownloadedEventListener;
+import org.bitcoinj.core.listeners.NewBestBlockListener;
+import org.bitcoinj.script.Script;
+import org.bitcoinj.store.BlockStore;
+import org.bitcoinj.store.BlockStoreException;
+import org.bitcoinj.wallet.listeners.WalletCoinsReceivedEventListener;
+import org.bitcoinj.wallet.listeners.WalletCoinsSentEventListener;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class BitcoinWrapperImpl implements BitcoinWrapper {
+
+    private record FederationListener(Federation federation, TransactionListener listener) {
+
+        @Override
+        public boolean equals(Object o) {
+            if (!(o instanceof FederationListener other)) {
+                return false;
+            }
+
+            return other.federation().equals(this.federation()) &&
+                other.listener() == this.listener();
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(federation(), System.identityHashCode(listener()));
+        }
+    }
+
+    private static final Logger logger = LoggerFactory.getLogger(BitcoinWrapperImpl.class);
+
+    private final Context btcContext;
+    private final List<FederationListener> watchedFederations;
+    private final List<BlockListener> blockListeners;
+    private final Collection<NewBestBlockListener> newBestBlockListeners;
+
+    private final Kit kit;
+
+    private boolean running = false;
+
+    public BitcoinWrapperImpl(
+        Context btcContext,
+        Kit kit
+    ) {
+        this.btcContext = btcContext;
+        this.blockListeners = new LinkedList<>();
+        this.watchedFederations = new LinkedList<>();
+        this.newBestBlockListeners = new LinkedList<>();
+        this.kit = kit;
+    }
+
+    @Override
+    public void setup(List<PeerAddress> peerAddresses) {
+        BlocksDownloadedEventListener blocksDownloadedEventListener = (peer, block, filteredBlock, blocksLeft) -> {
+            if (block != null && block.getTransactions() != null && !block.getTransactions().isEmpty()) {
+                // block may be empty if we are downloading just headers before fastCatchupTimeSecs
+                Context.propagate(btcContext);
+                for (BlockListener listener : blockListeners) {
+                    listener.onBlock(block);
+                }
+            }
+        };
+        WalletCoinsReceivedEventListener coinsReceivedEventListener = (
+            wallet,
+            tx,
+            prevBalance,
+            newBalance
+        ) -> coinsReceivedOrSent(tx);
+        WalletCoinsSentEventListener coinsSentEventListener = (
+            wallet,
+            tx,
+            prevBalance,
+            newBalance
+        ) -> coinsReceivedOrSent(tx);
+        NewBestBlockListener newBestBlockListener = storedBlock -> newBestBlockListeners.forEach(
+            listener -> listener.notifyNewBestBlock(storedBlock)
+        );
+
+        kit.setup(
+            blocksDownloadedEventListener,
+            coinsReceivedEventListener,
+            coinsSentEventListener,
+            newBestBlockListener
+        );
+
+        if (!peerAddresses.isEmpty()) {
+            kit.setPeerNodes(peerAddresses.toArray(new PeerAddress[]{}));
+        }
+    }
+
+    @Override
+    public void start(Duration progressCheckInterval) {
+        Context.propagate(btcContext);
+
+        long progressCheckIntervalMinutes = progressCheckInterval.toMinutes();
+        logger.info("[start] Starting BitcoinWrapper. Will check progress every {} minutes.", progressCheckIntervalMinutes);
+        Service service = kit.startAsync();
+        while (!service.isRunning()) {
+            try {
+                service.awaitRunning(progressCheckInterval.toMillis(), TimeUnit.MILLISECONDS);
+            } catch (TimeoutException e) {
+                logger.warn("[start] BitcoinWrapper not yet running after {} minutes. {}", progressCheckIntervalMinutes, e.getMessage());
+                checkPeers();
+            }
+        }
+        running = true;
+        logger.info("[start] BitcoinWrapper started successfully");
+        logBestChainHeight();
+    }
+
+    private void checkPeers() {
+        PeerGroup peerGroup = kit.peerGroup();
+        int connectedPeers = peerGroup != null ? peerGroup.numConnectedPeers() : 0;
+        // If no peers after the waiting interval, then probably the peer address is wrong or the network is not reachable
+        if (connectedPeers == 0) {
+            String message = "No Bitcoin peers connected. Check peer address and network parameters";
+            logger.error("[checkPeers] {}", message);
+            throw new IllegalStateException(message);
+        }
+        logger.info("[checkPeers] {} Bitcoin peers connected", connectedPeers);
+        logBestChainHeight();
+    }
+
+    private void logBestChainHeight() {
+        BlockChain chain = kit.chain();
+        int currentChainHeight = chain != null ? chain.getBestChainHeight() : -1;
+        PeerGroup peerGroup = kit.peerGroup();
+        int peerChainHeight = peerGroup != null ? peerGroup.getMostCommonChainHeight() : -1;
+        logger.info(
+            "[logBestChainHeight] Syncing... local height: {}, peer most common height: {}",
+            currentChainHeight,
+            peerChainHeight
+        );
+    }
+
+    @Override
+    public void stop() {
+        Context.propagate(btcContext);
+        kit.stopAsync().awaitTerminated();
+        running = false;
+        logger.debug("[stop] BitcoinWrapper stopped");
+    }
+
+    @Override
+    public int getBestChainHeight() {
+        return kit.chain().getBestChainHeight();
+    }
+
+    @Override
+    public StoredBlock getChainHead() {
+        return kit.chain().getChainHead();
+    }
+
+    @Override
+    public StoredBlock getBlock(Sha256Hash hash) throws BlockStoreException {
+        return kit.store().get(hash);
+    }
+
+    @Override
+    public StoredBlock getBlockAtHeight(int height) throws BlockStoreException {
+        logger.debug("[getBlockAtHeight] Getting block at height {}", height);
+        BlockStore blockStore = kit.store();
+        StoredBlock chainHead = blockStore.getChainHead();
+        Sha256Hash blockHash = chainHead.getHeader().getHash();
+        logger.debug("[getBlockAtHeight] Chain head is {} at height {}", blockHash, chainHead.getHeight());
+
+        if (height > chainHead.getHeight()) {
+            logger.debug("[getBlockAtHeight] Requested height {} is greater than chain head height {}", height, chainHead.getHeight());
+            return null;
+        }
+
+        for (int i = 0; i < (chainHead.getHeight() - height); i++) {
+            if (blockHash == null) {
+                return null;
+            }
+
+            StoredBlock currentBlock = blockStore.get(blockHash);
+            if (currentBlock == null) {
+                return null;
+            }
+            blockHash = currentBlock.getHeader().getPrevBlockHash();
+        }
+
+        if (blockHash == null) {
+            return null;
+        }
+        StoredBlock block = blockStore.get(blockHash);
+
+        if (block == null) {
+            return null;
+        }
+
+        if (block.getHeight() != height) {
+            String message = String.format(
+                "Block height is %d but should be %d. Block hash: %s",
+                block.getHeight(),
+                height,
+                block.getHeader().getHash()
+            );
+            logger.error("[getBlockAtHeight] {}", message);
+            throw new IllegalStateException(message);
+        }
+
+        logger.debug("[getBlockAtHeight] Found block {} at height {}", block.getHeader().getHash(), height);
+        return block;
+    }
+
+    @Override
+    public Set<Transaction> getTransactions(int minConfirmations) {
+        Set<Transaction> txs = new HashSet<>();
+        Set<Transaction> walletTransactions = kit.wallet().getTransactions(false);
+        logger.debug("[getTransactions] Found {} transactions in wallet. Will search for transactions with at least {} confirmations",
+            walletTransactions.size(),
+            minConfirmations
+        );
+
+        for (Transaction tx : walletTransactions) {
+            TransactionConfidence confidence = tx.getConfidence();
+            if (confidence.getConfidenceType() != ConfidenceType.BUILDING || confidence.getDepthInBlocks() < minConfirmations) {
+                logger.trace(
+                    "[getTransactions] Skipping transaction {} (wtxid: {}) with confidence type {} and depth {}",
+                    tx.getTxId(),
+                    tx.getWTxId(),
+                    confidence.getConfidenceType(),
+                    confidence.getDepthInBlocks()
+                );
+                continue;
+            }
+
+            txs.add(tx);
+            logger.trace(
+                "[getTransactions] Adding transaction {} (wtxid: {}) with confidence type {} and depth {}",
+                tx.getTxId(),
+                tx.getWTxId(),
+                confidence.getConfidenceType(),
+                confidence.getDepthInBlocks()
+            );
+        }
+
+        return txs;
+    }
+
+    @Override
+    public Map<Sha256Hash, Transaction> getTransactionMap(int minConfirmations) {
+        Map<Sha256Hash, Transaction> result = new HashMap<>();
+        Set<Transaction> txs = getTransactions(minConfirmations);
+        logger.trace(
+            "[getTransactionMap] Found {} transactions with at least {} confirmations",
+            txs.size(),
+            minConfirmations
+        );
+
+        for (Transaction tx : txs) {
+            logger.trace(
+                "[getTransactionMap] Adding transaction {} (wtxid: {}) to the map",
+                tx.getTxId(),
+                tx.getWTxId()
+            );
+            result.put(tx.getWTxId(), tx);
+        }
+
+        return result;
+    }
+
+    @Override
+    public void addFederationListener(Federation federation, TransactionListener listener) {
+        logger.trace("[addFederationListener] Adding listener for federation {}", federation.getAddress());
+        synchronized (this) {
+            if (!running) {
+                logger.debug(
+                    "[addFederationListener] BitcoinWrapper is not running, cannot add listener for federation {}",
+                    federation.getAddress()
+                );
+                return;
+            }
+
+            FederationListener federationListener = new FederationListener(federation, listener);
+
+            Address address = ThinConverter.toOriginalInstance(federation.getBtcParams(), federation.getAddress());
+            // If first, add watched address
+            if (watchedFederations.stream().noneMatch(watchedFederation -> watchedFederation.federation().equals(federation))) {
+                kit.wallet().addWatchedAddress(address, federation.getCreationTime().toEpochMilli());
+                logger.debug("[addFederationListener] Added address watch for federation {}", federation.getAddress());
+            }
+
+            if (watchedFederations.stream().noneMatch(watchedFederation -> watchedFederation.equals(federationListener))) {
+                watchedFederations.add(federationListener);
+                logger.debug("[addFederationListener] Added listener for federation {}", federation.getAddress());
+            }
+
+            traceWatchedFederations();
+        }
+    }
+
+    @Override
+    public void removeFederationListener(Federation federation, TransactionListener listener) {
+        logger.trace("[removeFederationListener] Removing listener for federation {}", federation.getAddress());
+        synchronized (this) {
+            if (!running) {
+                logger.debug(
+                    "[removeFederationListener] BitcoinWrapper is not running, cannot remove listener for federation {}",
+                    federation.getAddress()
+                );
+                return;
+            }
+
+            FederationListener federationListener = new FederationListener(federation, listener);
+
+            // Remove from watchlist
+            if (watchedFederations.stream().anyMatch(watchedFederation -> watchedFederation.equals(federationListener))) {
+                watchedFederations.remove(federationListener);
+                logger.debug("[removeFederationListener] Removed listener for federation {}", federation.getAddress());
+            }
+
+            // If none left, remove the watched script
+            if (watchedFederations.stream().noneMatch(watchedFederation -> watchedFederation.federation().equals(federation))) {
+                Script federationScript = new Script(federation.getP2SHScript().getProgram());
+                kit.wallet().removeWatchedScripts(Collections.singletonList(federationScript));
+                logger.debug("[removeFederationListener] Removed address watch for federation {}", federation.getAddress());
+            }
+
+            traceWatchedFederations();
+        }
+    }
+
+    private void traceWatchedFederations() {
+        logger.trace("[traceWatchedFederations] Now wallet is watching {} scripts", kit.wallet().getWatchedScripts().size());
+        for (Script script : kit.wallet().getWatchedScripts()) {
+            logger.trace("[traceWatchedFederations] Script {}", script);
+        }
+    }
+
+    @Override
+    public void addBlockListener(BlockListener listener) {
+        blockListeners.add(listener);
+    }
+
+    @Override
+    public void removeBlockListener(BlockListener listener) {
+        blockListeners.remove(listener);
+    }
+
+    @Override
+    public void addNewBlockListener(NewBestBlockListener newBestBlockListener) {
+        newBestBlockListeners.add(newBestBlockListener);
+    }
+
+    @Override
+    public void removeNewBestBlockListener(NewBestBlockListener newBestBlockListener) {
+        newBestBlockListeners.remove(newBestBlockListener);
+    }
+
+    protected void coinsReceivedOrSent(Transaction tx) {
+        if (watchedFederations.isEmpty()) {
+            logger.trace(
+                "[coinsReceivedOrSent] No watched federations, skipping transaction {} (wtxid: {})",
+                tx.getTxId(),
+                tx.getWTxId()
+            );
+            return;
+        }
+
+        logger.debug(
+            "[coinsReceivedOrSent] Received filtered transaction {} (wtxid: {}). Currently watching {} federations",
+            tx.getTxId(),
+            tx.getWTxId(),
+            watchedFederations.size()
+        );
+        Context.propagate(btcContext);
+
+        // Wrap tx in a co.rsk.bitcoinj.core.BtcTransaction
+        co.rsk.bitcoinj.core.Context btcContextThin = ThinConverter.toThinInstance(btcContext);
+        BtcTransaction btcTx = ThinConverter.toThinInstance(btcContextThin.getParams(), tx);
+
+        for (FederationListener watched : watchedFederations) {
+            Federation watchedFederation = watched.federation();
+            TransactionListener listener = watched.listener();
+            Wallet watchedFederationWallet = new BridgeBtcWallet(btcContextThin, Collections.singletonList(watchedFederation));
+            logger.debug(
+                "[coinsReceivedOrSent] Checking transaction {} (wtxid: {}) for watched federation {}",
+                tx.getTxId(),
+                tx.getWTxId(),
+                watchedFederation.getAddress()
+            );
+
+            co.rsk.bitcoinj.core.Coin valueSentToMe = btcTx.getValueSentToMe(watchedFederationWallet);
+            if (valueSentToMe.isZero()) {
+                continue;
+            }
+            listener.onTransaction(tx);
+        }
+    }
+}

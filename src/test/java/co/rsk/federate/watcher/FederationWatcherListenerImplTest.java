@@ -1,0 +1,146 @@
+package co.rsk.federate.watcher;
+
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+
+import co.rsk.bitcoinj.core.BtcECKey;
+import co.rsk.bitcoinj.core.NetworkParameters;
+import co.rsk.federate.BtcToRskClient;
+import co.rsk.federate.btcreleaseclient.BtcReleaseClient;
+import co.rsk.peg.federation.Federation;
+import co.rsk.peg.federation.FederationArgs;
+import co.rsk.peg.federation.FederationFactory;
+import co.rsk.peg.federation.FederationMember;
+import java.math.BigInteger;
+import java.time.Instant;
+import java.util.Arrays;
+import java.util.List;
+import org.ethereum.crypto.ECKey;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+class FederationWatcherListenerImplTest {
+
+    private static final NetworkParameters NETWORK_PARAMETERS = NetworkParameters.fromID(NetworkParameters.ID_REGTEST);
+
+    private static final List<FederationMember> FEDERATION_MEMBERS =
+        getFederationMembersFromPksForBtc(1000, 2000, 3000, 4000);
+    private static final long CREATION_BLOCK_NUMBER = 0L;
+    private static final Instant FEDERATION_CREATION_TIME = Instant.ofEpochMilli(5005L);
+    private static final FederationArgs FEDERATION_ARGS = new FederationArgs(
+        FEDERATION_MEMBERS, FEDERATION_CREATION_TIME, CREATION_BLOCK_NUMBER, NETWORK_PARAMETERS);
+    private static final Federation FEDERATION = FederationFactory.buildStandardMultiSigFederation(FEDERATION_ARGS);
+
+    private BtcToRskClient btcToRskClientActive;
+    private BtcToRskClient btcToRskClientRetiring;
+    private BtcReleaseClient btcReleaseClient;
+    private FederationWatcherListener federationWatcherListener;
+
+    @BeforeEach
+    void setUp() {
+        btcToRskClientActive = mock(BtcToRskClient.class);
+        btcToRskClientRetiring = mock(BtcToRskClient.class);
+        btcReleaseClient = mock(BtcReleaseClient.class);
+        federationWatcherListener = new FederationWatcherListenerImpl(btcToRskClientActive, btcToRskClientRetiring, btcReleaseClient);
+    }
+   
+    @Test
+    void onActiveFederationChange_whenFederationIsValid_shouldTriggerClientChange() {
+        // Act
+        federationWatcherListener.onActiveFederationChange(FEDERATION);
+
+        // Assert
+        verify(btcToRskClientActive).stop();
+        verify(btcReleaseClient).stop(FEDERATION);
+        verify(btcToRskClientActive).start(FEDERATION);
+        verify(btcReleaseClient).start(FEDERATION);
+    }
+
+    @Test
+    void onRetiringFederationChange_whenFederationIsNull_shouldClearRetiringFederationClient() {
+        // Act
+        federationWatcherListener.onRetiringFederationChange(null);
+
+        // Assert
+        verify(btcToRskClientRetiring).stop();
+    }
+
+    @Test
+    void onRetiringFederationChange_whenFederationIsValid_shouldTriggerClientChange() {
+        // Act
+        federationWatcherListener.onRetiringFederationChange(FEDERATION);
+
+        // Assert
+        verify(btcToRskClientRetiring).stop();
+        verify(btcReleaseClient).stop(FEDERATION);
+        verify(btcToRskClientRetiring).start(FEDERATION);
+        verify(btcReleaseClient).start(FEDERATION);
+    }
+
+    @Test
+    void triggerClientChange_whenExceptionOccurs_shouldPropagateException() {
+        // Arrange
+        // Simulate an exception in one of the called methods
+        RuntimeException exception = new RuntimeException("Simulated exception");
+        doThrow(exception).when(btcToRskClientActive).stop();
+
+        // Act & Assert
+        // The exception must reach the FederationWatcher, so it does not record this federation as
+        // already notified and retries the change on the next best block
+        RuntimeException thrownException = assertThrows(
+            RuntimeException.class,
+            () -> federationWatcherListener.onActiveFederationChange(FEDERATION));
+
+        assertSame(exception, thrownException);
+        verify(btcToRskClientActive, never()).start(FEDERATION);
+        verify(btcReleaseClient, never()).start(FEDERATION);
+    }
+
+    @Test
+    void onProposedFederationChange_whenNewProposedFederationIsNull_shouldNotStartClient() {
+        // Act
+        federationWatcherListener.onProposedFederationChange(null);
+
+        // Assert
+        verify(btcReleaseClient, never()).start(any(Federation.class));
+        verify(btcToRskClientActive, never()).start(FEDERATION);
+        verify(btcToRskClientRetiring, never()).start(FEDERATION);
+    }
+
+    @Test
+    void onProposedFederationChange_whenNewProposedFederationIsValid_shouldStartReleaseClient_shouldNotStartListener() {
+        // Act
+        federationWatcherListener.onProposedFederationChange(FEDERATION);
+
+        // Assert
+        verify(btcReleaseClient).start(FEDERATION);
+        verify(btcToRskClientActive, never()).start(FEDERATION);
+        verify(btcToRskClientRetiring, never()).start(FEDERATION);
+    }
+
+    @Test
+    void onProposedFederationChange_whenClientStartThrowsException_shouldPropagateException() {
+        // Arrange
+        RuntimeException exception = new RuntimeException("Start failed");
+        doThrow(exception).when(btcReleaseClient).start(FEDERATION);
+
+        // Act & Assert
+        RuntimeException thrownException = assertThrows(
+            RuntimeException.class,
+            () -> federationWatcherListener.onProposedFederationChange(FEDERATION));
+
+        assertSame(exception, thrownException);
+    }
+
+    private static List<FederationMember> getFederationMembersFromPksForBtc(Integer... pks) {
+        return Arrays.stream(pks).map(n -> new FederationMember(
+            BtcECKey.fromPrivate(BigInteger.valueOf(n)),
+            new ECKey(),
+            new ECKey())).toList();
+    }
+}

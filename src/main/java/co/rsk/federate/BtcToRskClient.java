@@ -1,0 +1,955 @@
+package co.rsk.federate;
+
+import static co.rsk.federate.PegUtils.isMigrationTx;
+import static co.rsk.federate.PegUtils.isPegOutTx;
+import static co.rsk.federate.PegUtils.isSVPSpendTx;
+import static co.rsk.federate.PegUtils.isValidPegInTx;
+
+import co.rsk.bitcoinj.core.BtcECKey;
+import co.rsk.bitcoinj.core.BtcTransaction;
+import co.rsk.bitcoinj.wallet.Wallet;
+import co.rsk.federate.adapter.ThinConverter;
+import co.rsk.federate.bitcoin.BitcoinWrapper;
+import co.rsk.federate.bitcoin.BlockListener;
+import co.rsk.federate.bitcoin.TransactionListener;
+import co.rsk.federate.config.PowpegNodeSystemProperties;
+import co.rsk.federate.io.BtcToRskClientFileData;
+import co.rsk.federate.io.BtcToRskClientFileReadResult;
+import co.rsk.federate.io.BtcToRskClientFileStorage;
+import co.rsk.federate.timing.TurnScheduler;
+import co.rsk.net.NodeBlockProcessor;
+import co.rsk.peg.BridgeUtils;
+import co.rsk.peg.PeginInformation;
+import co.rsk.peg.bitcoin.BitcoinUtils;
+import co.rsk.peg.btcLockSender.BtcLockSenderProvider;
+import co.rsk.peg.constants.BridgeConstants;
+import co.rsk.peg.federation.Federation;
+import co.rsk.peg.federation.FederationMember;
+import co.rsk.peg.pegininstructions.PeginInstructionsProvider;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Lists;
+import java.io.IOException;
+import java.math.BigInteger;
+import java.time.Clock;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
+import javax.annotation.PreDestroy;
+
+import org.bitcoinj.core.*;
+import org.bitcoinj.store.BlockStoreException;
+import org.ethereum.config.blockchain.upgrades.ActivationConfig;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class BtcToRskClient implements BlockListener, TransactionListener {
+    protected static final int MAXIMUM_REGISTER_BTC_LOCK_TXS_PER_TURN = 40;
+
+    private static final Logger logger = LoggerFactory.getLogger(BtcToRskClient.class);
+
+    private ActivationConfig activationConfig;
+    private BridgeConstants bridgeConstants;
+    private FederatorSupport federatorSupport;
+    private NodeBlockProcessor nodeBlockProcessor;
+    private BitcoinWrapper bitcoinWrapper;
+    private BtcToRskClientFileStorage btcToRskClientFileStorage;
+    private BtcLockSenderProvider btcLockSenderProvider;
+    private PeginInstructionsProvider peginInstructionsProvider;
+    private boolean isUpdateBridgeTimerEnabled;
+    private Federation federationToListen; // Federation on which this client is operating
+    private ScheduledExecutorService updateBridgeTimer; // Timer that updates the bridge periodically
+    private int maxAmountOfHeadersToSend; // Set max amount of headers to inform in a single call
+    private BtcToRskClientFileData fileData = new BtcToRskClientFileData();
+    private boolean shouldUpdateBridgeBtcBlockchain;
+    private boolean shouldUpdateBridgeBtcCoinbaseTransactions;
+    private boolean shouldUpdateBridgeBtcTransactions;
+    private boolean shouldUpdateCollections;
+
+    public BtcToRskClient() {}
+
+    // This constructor should only be used by tests.
+    protected BtcToRskClient(
+        BitcoinWrapper bitcoinWrapper,
+        FederatorSupport federatorSupport,
+        BridgeConstants bridgeConstants,
+        BtcToRskClientFileStorage btcToRskClientFileStorage,
+        BtcLockSenderProvider btcLockSenderProvider,
+        PeginInstructionsProvider peginInstructionsProvider,
+        Federation federationToListen,
+        PowpegNodeSystemProperties config
+    ) throws Exception {
+        this.bitcoinWrapper = bitcoinWrapper;
+        this.federatorSupport = federatorSupport;
+        this.bridgeConstants = bridgeConstants;
+        this.btcToRskClientFileStorage = btcToRskClientFileStorage;
+        this.restoreFileData();
+        this.btcLockSenderProvider = btcLockSenderProvider;
+        this.peginInstructionsProvider = peginInstructionsProvider;
+        this.federationToListen = federationToListen;
+        setConfigVariables(config);
+    }
+
+    public synchronized void setup(
+        BitcoinWrapper bitcoinWrapper,
+        BridgeConstants bridgeConstants,
+        BtcToRskClientFileStorage btcToRskClientFileStorage,
+        BtcLockSenderProvider btcLockSenderProvider,
+        PeginInstructionsProvider peginInstructionsProvider,
+        PowpegNodeSystemProperties config
+    ) throws Exception {
+        this.bridgeConstants = bridgeConstants;
+        this.btcToRskClientFileStorage = btcToRskClientFileStorage;
+        this.restoreFileData();
+        this.bitcoinWrapper = bitcoinWrapper;
+        this.btcLockSenderProvider = btcLockSenderProvider;
+        this.peginInstructionsProvider = peginInstructionsProvider;
+        bitcoinWrapper.addBlockListener(this);
+        setConfigVariables(config);
+
+        logger.debug("[setup] BtcToRskClient setup complete");
+ }
+
+    public void start(Federation federation) {
+        logger.info("[start] Starting for federation {}", federation.getAddress());
+
+        FederationMember federator = federatorSupport.getFederationMember();
+        BtcECKey federatorBtcKey = federator.getBtcPublicKey();
+        if (!federation.isMember(federator)) {
+            logger.warn(
+                "[start] Member {} is not part of the federation {}, skipping. This node will not watch this federation nor update the bridge for it",
+                federatorBtcKey,
+                federation.getAddress()
+            );
+            return;
+        }
+
+        this.federationToListen = federation;
+
+        logger.info(
+            "[start] Pegnatory {} watching federation {} since I belong to it",
+            federatorBtcKey,
+            federation.getAddress()
+        );
+        bitcoinWrapper.addFederationListener(federation, this);
+
+        Optional<Integer> federatorIndex = federation.getBtcPublicKeyIndex(federatorBtcKey);
+        if (federatorIndex.isEmpty()) {
+            String message = String.format(
+                "Federator %s is a member of the federation %s but could not find the btc public key index",
+                federator,
+                federation.getAddress()
+            );
+            logger.error("[start] {}", message);
+            throw new IllegalStateException(message);
+        }
+
+        if (isUpdateBridgeTimerEnabled) {
+            long now = Clock.systemUTC().instant().toEpochMilli();
+            TurnScheduler scheduler = new TurnScheduler(
+                bridgeConstants.getUpdateBridgeExecutionPeriod(),
+                federation.getSize()
+            );
+
+            this.updateBridgeTimer = Executors.newSingleThreadScheduledExecutor();
+
+            updateBridgeTimer.scheduleAtFixedRate(
+                this::updateBridge,
+                scheduler.getDelay(now, federatorIndex.get()),
+                scheduler.getInterval(),
+                TimeUnit.MILLISECONDS
+            );
+        } else {
+            logger.info("[start] updateBridgeTimer is disabled");
+        }
+    }
+
+    public void stop() {
+        logger.debug("[stop] Stopping");
+        this.federationToListen = null;
+
+        if (updateBridgeTimer != null) {
+            updateBridgeTimer.shutdown();
+            this.updateBridgeTimer = null;
+        }
+        logger.debug("[stop] Stopped");
+    }
+
+    public synchronized Map<Sha256Hash, List<Proof>> getTransactionsToSendToRsk() {
+        return fileData.getTransactionProofs();
+    }
+
+    public void updateBridge() {
+        if (federationToListen == null) {
+            logger.warn("[updateBridge] updateBridge skipped because no Federation is associated to this BtcToRskClient");
+            return;
+        }
+
+        if (nodeBlockProcessor.hasBetterBlockToSync()) {
+            logger.warn("[updateBridge] updateBridge skipped because the node is syncing blocks");
+            return;
+        }
+
+        logger.debug("[updateBridge] Updating bridge. Federation {}", federationToListen.getAddress());
+
+        if (shouldUpdateBridgeBtcBlockchain) {
+            // Call receiveHeaders
+            try {
+                int numberOfBlocksSent = updateBridgeBtcBlockchain();
+                logger.debug("[updateBridge] Updated bridge blockchain with {} blocks", numberOfBlocksSent);
+            } catch (Exception e) {
+                logger.error(e.getMessage(), e);
+            }
+        }
+
+        if (shouldUpdateBridgeBtcCoinbaseTransactions) {
+            // Call registerBtcCoinbaseTransaction
+            try {
+                logger.debug("[updateBridge] Updating coinbase transactions");
+                updateBridgeBtcCoinbaseTransactions();
+            } catch (Exception e) {
+                logger.error(e.getMessage(), e);
+            }
+        }
+
+        if (shouldUpdateBridgeBtcTransactions) {
+            // Call registerBtcTransaction
+            try {
+                logger.debug("[updateBridge] Updating BTC transactions");
+                updateBridgeBtcTransactions();
+            } catch (Exception e) {
+                logger.error(e.getMessage(), e);
+            }
+        }
+
+        if (shouldUpdateCollections) {
+            // Call updateCollections
+            try {
+                logger.debug("[updateBridge] Sending updateCollections");
+                federatorSupport.sendUpdateCollections();
+            } catch (Exception e) {
+                logger.error(e.getMessage(), e);
+            }
+        }
+    }
+
+    @Override
+    public void onBlock(Block block) {
+        synchronized (this) {
+            logger.debug("[onBlock] {}", block.getHash());
+            PartialMerkleTree tree;
+            Transaction coinbase = null;
+            boolean dataToWrite = false;
+            boolean coinbaseRegistered = false;
+            for (Transaction tx: block.getTransactions()) {
+
+                if (tx.isCoinBase()) {
+                    // safe keep the coinbase and move on
+                    logger.debug("[onBlock] Transaction {} is the coinbase", tx.getTxId());
+                    coinbase = tx;
+                    continue;
+                }
+
+                if (!fileData.getTransactionProofs().containsKey(tx.getWTxId())) {
+                    // this tx is not important move on
+                    continue;
+                }
+                logger.debug(
+                    "[onBlock] Found transaction {} (wtxid: {}) that needs to be registered in the Bridge",
+                    tx.getTxId(),
+                    tx.getWTxId()
+                );
+
+                List<Proof> proofs = fileData.getTransactionProofs().get(tx.getWTxId());
+                boolean blockInProofs = proofs.stream().anyMatch(p -> p.getBlockHash().equals(block.getHash()));
+                if (blockInProofs) {
+                    logger.info("[onBlock] Proof for tx {} in block {} already stored", tx.getTxId(), block.getHash());
+                    continue;
+                }
+
+                // Always use the wtxid for peg-in transactions
+                tree = generatePMT(block, tx, tx.hasWitnesses());
+                // If the transaction has a witness, then we need to store the coinbase information to inform it
+                if (tx.hasWitnesses() && !coinbaseRegistered) {
+                    logger.debug(
+                        "[onBlock] Transaction {} (wtxid: {}) has witness, will need to store the coinbase information to inform it",
+                        tx.getTxId(),
+                        tx.getWTxId()
+                    );
+                    // We don't want to generate the PMT with the wtxid for the coinbase
+                    // as it doesn't have a corresponding hash in the witness root
+                    PartialMerkleTree coinbasePmt = generatePMT(block, coinbase, false);
+                    try {
+                        Sha256Hash witnessMerkleRoot = tree.getTxnHashAndMerkleRoot(new ArrayList<>());
+                        CoinbaseInformation coinbaseInformation = new CoinbaseInformation(
+                            coinbase,
+                            witnessMerkleRoot,
+                            block.getHash(),
+                            coinbasePmt
+                        );
+                        validateCoinbaseInformation(coinbaseInformation);
+
+                        // store the coinbase
+                        fileData.getCoinbaseInformationMap().put(
+                            coinbaseInformation.getBlockHash(),
+                            coinbaseInformation
+                        );
+                        logger.debug(
+                            "[onBlock] Coinbase information for transaction {} (wtxid: {}) successully stored",
+                            tx.getTxId(),
+                            tx.getWTxId()
+                        );
+
+                        // Register the coinbase just once per block
+                        coinbaseRegistered = true;
+                    } catch (Exception e) {
+                        logger.error("[onBlock] {}", e.getMessage());
+                        // Without a coinbase related to this transaction the Bridge would reject the transaction
+                        return;
+                    }
+                }
+
+                proofs.add(new Proof(block.getHash(), tree));
+                logger.info(
+                    "[onBlock] New proof for tx {} (wtxid: {}) in block {}",
+                    tx.getTxId(),
+                    tx.getWTxId(),
+                    block.getHash()
+                );
+                dataToWrite = true;
+            }
+
+            if (!dataToWrite) {
+                return;
+            }
+
+            try {
+                this.btcToRskClientFileStorage.write(fileData);
+                logger.info("[onBlock] Stored proofs for block {}", block.getHash());
+            } catch (IOException e) {
+                logger.error("[onBlock] Error storing proof for block {}. {}", block.getHash(), e.getMessage());
+            }
+        }
+    }
+
+    private void validateCoinbaseInformation(CoinbaseInformation coinbaseInformation) {
+        Sha256Hash witnessMerkleRoot = coinbaseInformation.getWitnessRoot();
+        byte[] witnessReservedValue = coinbaseInformation.getCoinbaseWitnessReservedValue();
+        BtcTransaction coinbaseTransaction = ThinConverter.toThinInstance(
+            bridgeConstants.getBtcParams(),
+            coinbaseInformation.getCoinbaseTransaction()
+        );
+
+        if (witnessReservedValue == null) {
+            String message = String.format(
+                "Block %s with segwit peg-in tx %s has coinbase with no witness reserved value. Aborting block processing.",
+                coinbaseInformation.getBlockHash(),
+                coinbaseTransaction.getHash()
+            );
+            logger.error("[validateCoinbaseInformation] {}", message);
+            throw new IllegalArgumentException(message);
+        }
+
+        Optional<co.rsk.bitcoinj.core.Sha256Hash> expectedWitnessCommitment = BitcoinUtils.findWitnessCommitment(
+            coinbaseTransaction,
+            federatorSupport.getConfigForBestBlock()
+        );
+        co.rsk.bitcoinj.core.Sha256Hash calculatedWitnessCommitment = co.rsk.bitcoinj.core.Sha256Hash.twiceOf(
+            witnessMerkleRoot.getReversedBytes(),
+            witnessReservedValue
+        );
+
+        if (expectedWitnessCommitment.isEmpty() || !expectedWitnessCommitment.get().equals(calculatedWitnessCommitment)) {
+            String message = String.format(
+                "Block %s with segwit peg-in tx %s generated an invalid witness commitment",
+                coinbaseInformation.getBlockHash(),
+                coinbaseTransaction.getHash()
+            );
+            logger.error("[validateCoinbaseInformation] {}", message);
+            throw new IllegalArgumentException(message);
+        }
+
+        logger.debug(
+            "[validateCoinbaseInformation] Block {} with segwit peg-in tx {} has a valid witness merkle root",
+            coinbaseInformation.getBlockHash(),
+            coinbaseTransaction.getHash()
+        );
+    }
+
+    @Override
+    public void onTransaction(Transaction tx) {
+        logger.debug("[onTransaction] {} (wtxid:{})", tx.getTxId(), tx.getWTxId());
+        synchronized (this) {
+            this.fileData.getTransactionProofs().put(tx.getWTxId(), new ArrayList<>());
+            try {
+                this.btcToRskClientFileStorage.write(this.fileData);
+            } catch (IOException e) {
+                logger.error(e.getMessage(), e);
+            }
+        }
+    }
+
+    protected int updateBridgeBtcBlockchain() throws BlockStoreException {
+        // Pre-check: if the Bridge already knows our best block, there's nothing new to inform
+        StoredBlock bitcoinChainHead = bitcoinWrapper.getChainHead();
+        if (federatorSupport.isBlockHashInformedToBridge(bitcoinChainHead.getHeader().getHash())) {
+            logger.debug("[updateBridgeBtcBlockchain] Federator best block already informed to the Bridge; nothing to do");
+            return 0;
+        }
+
+        logger.debug("[updateBridgeBtcBlockchain] Federator best block is not yet informed to the Bridge");
+        // First, find the common ancestor that is in the federator's bestchain
+        // using block depth incremental search
+        int bridgeBtcBlockchainBestChainHeight = federatorSupport.getBridgeBtcBlockchainBestChainHeight();
+        Optional<StoredBlock> commonAncestorOpt = findBridgeBtcBlockchainMatchingAncestor(bridgeBtcBlockchainBestChainHeight);
+        if (commonAncestorOpt.isEmpty()) {
+            throw new BlockStoreException("No best chain block found");
+        }
+        StoredBlock commonAncestor = commonAncestorOpt.get();
+        logger.debug("[updateBridgeBtcBlockchain] Common ancestor is {}.", commonAncestor.getHeader().getHash());
+
+        // If federator's blockchain has more work than bridge's blockchain, update it
+        BigInteger bridgeBitcoinChainWork = calculateBridgeBitcoinChainWork(commonAncestor);
+        BigInteger bitcoinBestChainWork = bitcoinChainHead.getChainWork();
+        // Compare total cumulative work
+        boolean shouldUpdateBridge = bitcoinBestChainWork.compareTo(bridgeBitcoinChainWork) > 0;
+        logger.debug(
+            "[updateBridgeBtcBlockchain] Heights - Federator: {}, Bridge: {}. Total work - Federator: {}, Bridge: {}. Should we update bridge? {}",
+            bitcoinWrapper.getBestChainHeight(),
+            bridgeBtcBlockchainBestChainHeight,
+            bitcoinBestChainWork,
+            bridgeBitcoinChainWork,
+            shouldUpdateBridge
+        );
+        if (!shouldUpdateBridge) {
+            logger.warn("[updateBridgeBtcBlockchain] Bridge has more work than Federator, so we won't update it.");
+            return 0;
+        }
+
+        StoredBlock currentBlock = bitcoinChainHead;
+        List<Block> totalHeadersToSendToBridge = new ArrayList<>();
+        while (!currentBlock.equals(commonAncestor)) {
+            Block currentBlockHeader = currentBlock.getHeader();
+            totalHeadersToSendToBridge.add(currentBlockHeader);
+            currentBlock = bitcoinWrapper.getBlock(currentBlockHeader.getPrevBlockHash());
+        }
+        totalHeadersToSendToBridge = Lists.reverse(totalHeadersToSendToBridge);
+
+        int from = findFirstUnknownHeader(totalHeadersToSendToBridge);
+        if (from == totalHeadersToSendToBridge.size()) {
+            logger.debug("[updateBridgeBtcBlockchain] All headers already registered; nothing to inform");
+            return 0;
+        }
+        int to = Math.min(from + maxAmountOfHeadersToSend, totalHeadersToSendToBridge.size());
+        List<Block> headersToSendToBridge = totalHeadersToSendToBridge.subList(from, to);
+        federatorSupport.sendReceiveHeaders(headersToSendToBridge.toArray(new Block[]{}));
+
+        int headersToSendToBridgeCount = headersToSendToBridge.size();
+        logger.debug(
+            "[updateBridgeBtcBlockchain] Invoked receiveHeaders with {} blocks. First {}, Last {}.",
+            headersToSendToBridgeCount,
+            headersToSendToBridge.get(0).getHash(),
+            headersToSendToBridge.get(headersToSendToBridgeCount - 1).getHash()
+        );
+        return headersToSendToBridgeCount;
+    }
+
+    private BigInteger calculateBridgeBitcoinChainWork(StoredBlock commonAncestor) {
+        NetworkParameters params = ThinConverter.toOriginalInstance(bridgeConstants.getBtcParamsString());
+        Sha256Hash ancestorHash = commonAncestor.getHeader().getHash();
+        Block currentHeader = new Block(params, federatorSupport.getBridgeBtcBlockchainBestBlockHeader());
+        BigInteger cumulativeWorkAboveAncestor = BigInteger.ZERO;
+        while (!currentHeader.getHash().equals(ancestorHash)) {
+            BigInteger currentBlockWork = currentHeader.getWork();
+            cumulativeWorkAboveAncestor = cumulativeWorkAboveAncestor.add(currentBlockWork);
+
+            byte[] parentPayloadBytes = federatorSupport.getBridgeBtcBlockchainParentBlockHeaderByHash(currentHeader.getHash());
+            currentHeader = new Block(params, parentPayloadBytes);
+        }
+
+        return commonAncestor.getChainWork().add(cumulativeWorkAboveAncestor);
+    }
+
+    private int findFirstUnknownHeader(List<Block> headersToSendToBridge) {
+        // Binary search
+        int low = 0;
+        int high = headersToSendToBridge.size();
+        while (low < high) {
+            int mid = (low + high) / 2;
+            Sha256Hash midHash = headersToSendToBridge.get(mid).getHash();
+            if (federatorSupport.isBlockHashInformedToBridge(midHash)) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+
+        return low;
+    }
+
+    private Optional<StoredBlock> findBridgeBtcBlockchainMatchingAncestor(int bridgeBtcBlockchainBestChainHeight) throws BlockStoreException {
+        // Find the last federator's best chain block the bridge has and update from there
+        int bridgeBtcBlockchainInitialBlockHeight = federatorSupport.getBtcBlockchainInitialBlockHeight();
+        int maxSearchDepth = bridgeBtcBlockchainBestChainHeight - bridgeBtcBlockchainInitialBlockHeight;
+        logger.debug(
+            "[findBridgeBtcBlockchainMatchingAncestor] Bridge BTC blockchain initial block height: {}, max search depth : {}.",
+            bridgeBtcBlockchainInitialBlockHeight,
+            maxSearchDepth
+        );
+
+        int currentSearchDepth = 0;
+        int iteration = 0;
+        while (true) {
+            Sha256Hash storedBlockHash = federatorSupport.getBridgeBtcBlockchainBlockHashAtDepth(currentSearchDepth);
+            Optional<StoredBlock> storedBlock = getMatchingStoredBlockInMainChain(storedBlockHash);
+            logger.trace(
+                "[findBridgeBtcBlockchainMatchingAncestor] block[storedBlockHash] found? {}",
+                storedBlock.isPresent()
+            );
+            if (storedBlock.isPresent()) {
+                return storedBlock;
+            }
+
+            // Have we just searched at maximum depth? If so, no more to search, nothing found!
+            if (currentSearchDepth == maxSearchDepth) {
+                break;
+            }
+
+            // Exponentially increase the search depth in the blockchain
+            // so that we find an ancestor fast in case of a fork.
+            // The normal case is the federator's btc blockchain
+            // is just one block ahead, so the block at bridge btc blockchain depth zero is the parent
+            // of the current fed block, hence the ancestor is immediately found and this code isn't reached.
+            currentSearchDepth = IntStream.of(1 << iteration, maxSearchDepth).min().getAsInt();
+            iteration++;
+        }
+        return Optional.empty();
+    }
+
+    private Optional<StoredBlock> getMatchingStoredBlockInMainChain(Sha256Hash blockHash) throws BlockStoreException {
+        StoredBlock storedBlock = bitcoinWrapper.getBlock(blockHash);
+        if (storedBlock == null) {
+            return Optional.empty();
+        }
+        int storedBlockHeight = storedBlock.getHeight();
+        StoredBlock storedBlockAtHeightInBestChain = bitcoinWrapper.getBlockAtHeight(storedBlockHeight);
+        boolean isBlockInBestChain = storedBlock.equals(storedBlockAtHeightInBestChain);
+        logger.trace(
+            "[getMatchingStoredBlockInMainChain] block[{}] in best chain? {}",
+            storedBlock.getHeader().getHash(),
+            isBlockInBestChain
+        );
+        if (isBlockInBestChain) {
+            return Optional.of(storedBlockAtHeightInBestChain);
+        }
+
+        return Optional.empty();
+    }
+
+    protected void updateBridgeBtcTransactions() {
+        logger.debug("[updateBridgeBtcTransactions] Updating btc transactions");
+        co.rsk.bitcoinj.core.Context context = co.rsk.bitcoinj.core.Context.getOrCreate(bridgeConstants.getBtcParams());
+        co.rsk.bitcoinj.wallet.Wallet federationWallet = BridgeUtils.getFederationNoSpendWallet(
+            context,
+            federationToListen,
+            false,
+            null
+        );
+
+        FederationProviderFromFederatorSupport federationProviderFromFederatorSupport = new FederationProviderFromFederatorSupport(
+            federatorSupport,
+            bridgeConstants.getFederationConstants()
+        );
+        Optional<Federation> proposedFederation = federationProviderFromFederatorSupport.getProposedFederation();
+        Optional<Federation> retiringFederation = federationProviderFromFederatorSupport.getRetiringFederation();
+        Federation activeFederation = federationProviderFromFederatorSupport.getActiveFederation();
+
+        int btcToRskMinimumAcceptableConfirmations = bridgeConstants.getBtc2RskMinimumAcceptableConfirmations();
+        Map<Sha256Hash, Transaction> federatorWalletTxMap = bitcoinWrapper.getTransactionMap(btcToRskMinimumAcceptableConfirmations);
+
+        Set<Sha256Hash> txsToSendToRskHashes = this.fileData.getTransactionProofs().keySet();
+        logger.debug("[updateBridgeBtcTransactions] Tx to send count: {}", txsToSendToRskHashes.size());
+
+        int numberOfTxsSent = 0;
+
+        Iterator<Sha256Hash> txHashIterator = txsToSendToRskHashes.iterator();
+        while (txHashIterator.hasNext()) {
+            Sha256Hash txHash = txHashIterator.next();
+            try {
+                Transaction tx = federatorWalletTxMap.get(txHash);
+                logger.debug("[updateBridgeBtcTransactions] Evaluating Btc Tx {}", txHash);
+
+                if (tx == null) {
+                    logger.debug(
+                        "[updateBridgeBtcTransactions] Btc tx {} was not found in wallet or is not yet confirmed.",
+                        txHash
+                    );
+                    // Don't remove it as we still have to wait for its confirmations.
+                    continue;
+                }
+
+                Sha256Hash txId = tx.getTxId();
+                Sha256Hash wTxId = tx.getWTxId();
+                logger.debug(
+                    "[updateBridgeBtcTransactions] Got Btc Tx {} (wtxid:{})",
+                    txId,
+                    wTxId
+                );
+
+                // Check if the tx was processed (using the tx hash without witness)
+                if (federatorSupport.isBtcTxHashAlreadyProcessed(txId)) {
+                    logger.debug(
+                        "[updateBridgeBtcTransactions] Btc Tx {} (wtxid: {}) already processed",
+                        txId,
+                        wTxId
+                    );
+
+                    // N = height at which transaction was processed
+                    // M = current height M
+                    // K = btcToRskMinimumAcceptableConfirmationsOnRsk
+                    // If M >= N + K, then remove the transaction from the list
+                    Long txProcessedHeight = federatorSupport.getBtcTxHashProcessedHeight(txId);
+                    Long bestChainHeight = federatorSupport.getRskBestChainHeight();
+                    if (bestChainHeight >= txProcessedHeight + getBtcToRskMinimumAcceptableConfirmationsOnRsk()) {
+                        removeTxHashFromFile(txHashIterator);
+                        logger.debug(
+                            "[updateBridgeBtcTransactions] Btc Tx {} was processed at height {}, current height is {}. Tx removed from pending lock list",
+                            txHash,
+                            txProcessedHeight,
+                            bestChainHeight
+                        );
+                    }
+
+                    // already processed tx should not be sent again
+                    continue;
+                }
+
+                synchronized (this) {
+                    // validate tx proofs, stored block and pmt are found
+                    Optional<List<Proof>> txProofs = getTxProofs(tx);
+                    if (txProofs.isEmpty()) {
+                        logger.debug("[updateBridgeBtcTransactions] Couldn't find proof for tx {}", txHash);
+                        continue;
+                    }
+                    Optional<StoredBlock> txStoredBlockOpt = getStoredBlock(tx);
+                    if (txStoredBlockOpt.isEmpty()) {
+                        logger.debug("[updateBridgeBtcTransactions] Couldn't find stored block for tx {}", txHash);
+                        continue;
+                    }
+                    StoredBlock txStoredBlock = txStoredBlockOpt.get();
+                    Optional<PartialMerkleTree> pmt = getPMT(txProofs.get(), txStoredBlock);
+                    if (pmt.isEmpty()) {
+                        logger.debug("[updateBridgeBtcTransactions] Couldn't find pmt for tx {}", txHash);
+                        continue;
+                    }
+
+                    if (!shouldSendTx(tx, federationWallet, proposedFederation, retiringFederation, activeFederation)) {
+                        removeTxHashFromFile(txHashIterator);
+                        logger.warn(
+                            "[updateBridgeBtcTransactions] Removed transaction {} (wtxid: {}) from txs to send to the Bridge",
+                            txId,
+                            wTxId
+                        );
+                        continue;
+                    }
+
+                    sendTx(tx, txStoredBlock, pmt.get());
+                    numberOfTxsSent++;
+                    // Sent a maximum of 40 registerBtcTransaction txs per federator
+                    if (numberOfTxsSent >= MAXIMUM_REGISTER_BTC_LOCK_TXS_PER_TURN) {
+                        logger.debug(
+                            "[updateBridgeBtcTransactions] Reached maximum number of txs to send to the Bridge: {}",
+                            MAXIMUM_REGISTER_BTC_LOCK_TXS_PER_TURN
+                        );
+                        break;
+                    }
+                }
+            } catch (Exception e) {
+                logger.error(
+                    "[updateBridgeBtcTransactions] An error occurred while informing transaction {} to the Bridge. {}",
+                    txHash,
+                    e.getMessage()
+                );
+            }
+        }
+    }
+
+    private int getBtcToRskMinimumAcceptableConfirmationsOnRsk() {
+        boolean networkIsMainnet = co.rsk.bitcoinj.core.NetworkParameters.ID_MAINNET.equals(bridgeConstants.getBtcParams().getId());
+        if (networkIsMainnet) {
+            return 1000;
+        }
+
+        return 100;
+    }
+
+    private void removeTxHashFromFile(Iterator<Sha256Hash> txHashIterator) {
+        txHashIterator.remove();
+        writeToStorage();
+    }
+
+    private void writeToStorage() {
+        synchronized (this) {
+            try {
+                this.btcToRskClientFileStorage.write(this.fileData);
+                logger.debug("[writeToStorage] Persisted fileData to storage.");
+            } catch (IOException e) {
+                logger.error("[writeToStorage] Error {} persisting fileData to storage.", e.getMessage(), e);
+            }
+        }
+    }
+
+    private Optional<List<Proof>> getTxProofs(Transaction tx) {
+        Map<Sha256Hash, List<Proof>> proofs = this.fileData.getTransactionProofs();
+
+        Sha256Hash txHash = tx.getWTxId();
+        return Optional.ofNullable(proofs.get(txHash))
+            .filter(txProofs -> !txProofs.isEmpty());
+    }
+
+    private Optional<StoredBlock> getStoredBlock(Transaction tx) {
+        try {
+            return findBestChainStoredBlockFor(tx);
+        } catch (BlockStoreException e) {
+            return Optional.empty();
+        }
+    }
+
+    private Optional<PartialMerkleTree> getPMT(List<Proof> txProofs, StoredBlock txStoredBlock) {
+        Sha256Hash blockHash = txStoredBlock.getHeader().getHash();
+
+        return txProofs.stream()
+            .filter(proof -> proof.getBlockHash().equals(blockHash))
+            .findFirst()
+            .map(Proof::getPartialMerkleTree);
+    }
+
+    private boolean shouldSendTx(Transaction tx, Wallet federationWallet, Optional<Federation> proposedFederation, Optional<Federation> retiringFederation, Federation activeFederation) {
+        logger.debug("[shouldSendTx] Checking if tx should be sent {} (wtxid: {})", tx.getTxId(), tx.getWTxId());
+        BtcTransaction btcTx = ThinConverter.toThinInstance(federationWallet.getNetworkParameters(), tx);
+
+        co.rsk.bitcoinj.core.Coin valueSentToMe = btcTx.getValueSentToMe(federationWallet);
+        if (valueSentToMe.isZero()) {
+            return false;
+        }
+
+        long bestBlockNumber = federatorSupport.getRskBestChainHeight();
+        ActivationConfig.ForBlock activations = activationConfig.forBlock(bestBlockNumber);
+        PeginInformation peginInformation = new PeginInformation(
+            btcLockSenderProvider,
+            peginInstructionsProvider,
+            activations
+        );
+
+        if (proposedFederation.isPresent() && isSVPSpendTx(btcTx, proposedFederation.get(), activeFederation)) {
+            return true;
+        }
+        if (retiringFederation.isPresent() && isMigrationTx(btcTx, retiringFederation.get(), activeFederation)) {
+            return true;
+        }
+        if (isPegOutTx(btcTx, federationToListen)) {
+            return true;
+        }
+        return isValidPegInTx(btcTx, federationWallet, peginInformation);
+    }
+
+    private void sendTx(Transaction tx, StoredBlock txStoredBlock, PartialMerkleTree pmt) {
+        int blockHeight = txStoredBlock.getHeight();
+
+        logger.debug(
+            "[sendTx] Will send btc tx {} (wtxid: {}) with enough confirmations. Belongs to block {} at height {}",
+            tx.getTxId(),
+            tx.getWTxId(),
+            txStoredBlock.getHeader().getHash(),
+            blockHeight
+        );
+
+        federatorSupport.sendRegisterBtcTransaction(tx, blockHeight, pmt);
+        logger.debug(
+            "[sendTx] Invoked registerBtcTransaction for tx {} (wtxid: {})",
+            tx.getTxId(),
+            tx.getWTxId()
+        );
+    }
+
+    /**
+     * Sends the coinbases transactions that should be informed
+     */
+    protected void updateBridgeBtcCoinbaseTransactions() {
+        Map<Sha256Hash, CoinbaseInformation> coinbaseInformationMap = this.fileData.getCoinbaseInformationMap();
+        if (coinbaseInformationMap.isEmpty()) {
+            logger.debug("[updateBridgeBtcCoinbaseTransactions] no coinbase transaction to inform");
+            return;
+        }
+
+        Set<Sha256Hash> coinbaseTxsToSendToBridgeBlockHashes = coinbaseInformationMap.keySet();
+        logger.debug("[updateBridgeBtcCoinbaseTransactions] Coinbase txs to send count: {}", coinbaseTxsToSendToBridgeBlockHashes.size());
+
+        Iterator<Sha256Hash> coinbaseBlockHashIterator = coinbaseTxsToSendToBridgeBlockHashes.iterator();
+        // Inform coinbases whose block was already informed to the Bridge
+        while (coinbaseBlockHashIterator.hasNext()) {
+            Sha256Hash coinbaseBlockHash = coinbaseBlockHashIterator.next();
+            CoinbaseInformation coinbaseInformation = coinbaseInformationMap.get(coinbaseBlockHash);
+
+            Sha256Hash coinbaseTxHash = coinbaseInformation.getCoinbaseTransaction().getTxId();
+            if (federatorSupport.hasBlockCoinbaseInformed(coinbaseBlockHash)) {
+                logger.debug(
+                    "[updateBridgeBtcCoinbaseTransactions] Coinbase tx {} of block {} was already informed. Removing from map",
+                    coinbaseTxHash,
+                    coinbaseBlockHash
+                );
+
+                removeCoinbaseBlockHashFromMap(coinbaseBlockHashIterator);
+                continue;
+            }
+
+            try {
+                Optional<StoredBlock> coinbaseStoredBlock = getMatchingStoredBlockInMainChain(coinbaseBlockHash);
+                if (coinbaseStoredBlock.isEmpty()) {
+                    logger.debug("[updateBridgeBtcCoinbaseTransactions] Coinbase tx of block {} does not belong to main chain any more. Removing from map",
+                        coinbaseBlockHash
+                    );
+                    removeCoinbaseBlockHashFromMap(coinbaseBlockHashIterator);
+                    continue;
+                }
+            } catch (BlockStoreException e) {
+                logger.error(e.getMessage(), e);
+                continue;
+            }
+
+            if (!federatorSupport.isBlockHashInformedToBridge(coinbaseBlockHash)) {
+                logger.debug(
+                    "[updateBridgeBtcCoinbaseTransactions] Block {} for coinbase tx {} is not yet informed to Bridge",
+                    coinbaseBlockHash,
+                    coinbaseTxHash
+                );
+                continue;
+            }
+
+            logger.debug(
+                "[updateBridgeBtcCoinbaseTransactions] Informing coinbase transaction {}",
+                coinbaseTxHash
+            );
+            federatorSupport.sendRegisterCoinbaseTransaction(coinbaseInformation);
+        }
+    }
+
+    private void removeCoinbaseBlockHashFromMap(Iterator<Sha256Hash> blockHashIterator) {
+        blockHashIterator.remove();
+        writeToStorage();
+    }
+
+    /**
+     * Finds the block in the best chain where supplied tx appears.
+     */
+    private Optional<StoredBlock> findBestChainStoredBlockFor(Transaction tx) throws BlockStoreException {
+        Map<Sha256Hash, Integer> blockHashes = tx.getAppearsInHashes();
+
+        if (blockHashes != null) {
+            for (Sha256Hash blockHash : blockHashes.keySet()) {
+                Optional<StoredBlock> storedBlock = getMatchingStoredBlockInMainChain(blockHash);
+                if (storedBlock.isPresent()) {
+                    return storedBlock;
+                }
+            }
+        }
+
+        return Optional.empty();
+    }
+
+    @PreDestroy
+    public void tearDown() throws IOException {
+        logger.info("[tearDown] BtcToRskClient tearDown starting...");
+
+        if (federationToListen != null) {
+            bitcoinWrapper.removeFederationListener(federationToListen, this);
+        }
+
+        bitcoinWrapper.removeBlockListener(this);
+
+        synchronized (this) {
+            this.btcToRskClientFileStorage.write(this.fileData);
+        }
+
+        logger.info("[tearDown] BtcToRskClient tearDown finished.");
+    }
+
+    private void restoreFileData() throws Exception {
+        NetworkParameters networkParameters = ThinConverter.toOriginalInstance(bridgeConstants.getBtcParamsString());
+        synchronized (this) {
+            try {
+                BtcToRskClientFileReadResult result = this.btcToRskClientFileStorage.read(networkParameters);
+                if (result.getSuccess().equals(Boolean.TRUE)) {
+                    this.fileData = result.getData();
+                } else {
+                    String errorMessage = "Can't operate without a valid storage file";
+                    logger.error("[restoreFileData] {}", errorMessage);
+                    throw new Exception(errorMessage);
+                }
+            } catch (IOException e) {
+                String errorMessage = "Failed to read data from BtcToRskClient file";
+                logger.error("[restoreFileData] {}: {}", errorMessage, e.getMessage(), e);
+                throw new Exception("Failed to read data from BtcToRskClient file", e);
+            }
+        }
+    }
+
+    @VisibleForTesting
+    protected PartialMerkleTree generatePMT(Block block, Transaction transaction, boolean useWtxId) {
+        List<Transaction> txns = block.getTransactions();
+        List<Sha256Hash> txHashes = new ArrayList<>(txns.size());
+        Sha256Hash transactionId = useWtxId ? transaction.getWTxId() : transaction.getTxId();
+        byte[] bits = new byte[(int) Math.ceil(txns.size() / 8.0)];
+        for (int i = 0; i < txns.size(); i++) {
+            Transaction tx = txns.get(i);
+            Sha256Hash txId = useWtxId ? tx.getWTxId() : tx.getTxId();
+            // If we are using wtxId, the coinbase must be included as a ZERO hash
+            if (useWtxId && tx.isCoinBase()) {
+                txId = Sha256Hash.ZERO_HASH;
+            }
+            txHashes.add(txId);
+            if (txId.equals(transactionId)) {
+                Utils.setBitLE(bits, i);
+            }
+        }
+        return PartialMerkleTree.buildFromLeaves(block.getParams(), bits, txHashes);
+    }
+
+    @VisibleForTesting
+    protected PartialMerkleTree generatePMT(Block block, Transaction transaction) {
+        return generatePMT(block, transaction, transaction.hasWitnesses());
+    }
+
+    private void setConfigVariables(PowpegNodeSystemProperties config) {
+        this.activationConfig = config.getActivationConfig();
+        this.isUpdateBridgeTimerEnabled = config.isUpdateBridgeTimerEnabled();
+        this.maxAmountOfHeadersToSend = config.getAmountOfHeadersToSend();
+        this.shouldUpdateBridgeBtcBlockchain = config.shouldUpdateBridgeBtcBlockchain();
+        this.shouldUpdateBridgeBtcCoinbaseTransactions = config.shouldUpdateBridgeBtcCoinbaseTransactions();
+        this.shouldUpdateBridgeBtcTransactions = config.shouldUpdateBridgeBtcTransactions();
+        this.shouldUpdateCollections = config.shouldUpdateCollections();
+    }
+
+    public static class Factory {
+        private final FederatorSupport federatorSupport;
+        private final NodeBlockProcessor nodeBlockProcessor;
+
+        public Factory(FederatorSupport federatorSupport, NodeBlockProcessor nodeBlockProcessor) {
+            this.federatorSupport = federatorSupport;
+            this.nodeBlockProcessor = nodeBlockProcessor;
+        }
+
+        public BtcToRskClient build() {
+            BtcToRskClient btcToRskClient = new BtcToRskClient();
+            btcToRskClient.federatorSupport = federatorSupport;
+            btcToRskClient.nodeBlockProcessor = nodeBlockProcessor;
+            return btcToRskClient;
+        }
+    }
+}
